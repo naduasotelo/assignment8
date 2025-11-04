@@ -1,0 +1,78 @@
+name: Update Activity Log
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */12 * * *"   # every 12 hours
+  push:
+    paths:
+      - ".github/workflows/activity-log.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Fetch recent activity → activity.md
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          USER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/users/$USER/events?per_page=20" > events.json
+
+          jq -r '
+            [
+              .[] |
+              select(.type=="PushEvent" or .type=="PullRequestEvent" or .type=="IssuesEvent" or .type=="CreateEvent" or .type=="ReleaseEvent") |
+              if .type=="PushEvent" then
+                "* " + (.created_at|split("T")[0]) + " — Pushed to **" + .repo.name + "** (" + ((.payload.commits|length)//0|tostring) + " commit(s))"
+              elif .type=="PullRequestEvent" then
+                "* " + (.created_at|split("T")[0]) + " — PR " + .payload.action + " in **" + .repo.name + "**: #" + (.payload.number|tostring) + " " + .payload.pull_request.title + " [" + .payload.pull_request.html_url + "]"
+              elif .type=="IssuesEvent" then
+                "* " + (.created_at|split("T")[0]) + " — Issue " + .payload.action + " in **" + .repo.name + "**: #" + (.payload.issue.number|tostring) + " " + .payload.issue.title + " [" + .payload.issue.html_url + "]"
+              elif .type=="CreateEvent" then
+                "* " + (.created_at|split("T")[0]) + " — Created " + .payload.ref_type + " **" + (.payload.ref//"") + "** in **" + .repo.name + "**"
+              elif .type=="ReleaseEvent" then
+                "* " + (.created_at|split("T")[0]) + " — Release " + .payload.action + " in **" + .repo.name + "**: " + .payload.release.name + " [" + .payload.release.html_url + "]"
+              else empty end
+            ] | .[0:10] | join("\n")
+          ' events.json > activity.md
+
+      - name: Update README between markers
+        run: |
+          set -euo pipefail
+          START="<!-- ACTIVITY-START -->"
+          END="<!-- ACTIVITY-END -->"
+          CONTENT="$(cat activity.md)"
+          ESCAPED=$(printf '%s\n' "$CONTENT" | sed -e 's/[\/&]/\\&/g')
+          awk -v start="$START" -v end="$END" -v repl="$ESCAPED" '
+            BEGIN{inblk=0; found=0}
+            $0==start { print; print repl; inblk=1; found=1; next }
+            $0==end   { inblk=0 }
+            !inblk    { print }
+            END{ if(!found){ print start "\n" repl "\n" end } }
+          ' README.md > README.new
+          mv README.new README.md
+
+      - name: Commit & push if changed
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet; then
+            git add README.md
+            git commit -m "chore: auto-update activity log [skip ci]"
+            git push
+          else
+            echo "No changes to commit."
+          fi
